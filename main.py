@@ -116,31 +116,37 @@ class ChequeProcessor:
     def _get_field_prompt(self, field_name: str) -> str:
         confidence_instructions = (
             f"**Confidence Scoring (Strict, Character-Informed, and Defensible):**\n"
-            f"1.  **Core Principle:** A field's overall confidence is **limited by the lowest confidence of any of its individual characters.**\n"
-            f"2.  **Calculation Basis:** Your score must integrate: a) Visual quality (blur, smudge), b) Handwriting legibility, c) Character ambiguity ('O' vs '0', '1' vs '7'), and d) Adherence to format rules.\n"
-            f"3.  **Strict Benchmarks:** `0.98-1.00` (Perfect/Production Ready), `0.90-0.97` (High/Review Recommended), `0.75-0.89` (Moderate/Human Review Required), `< 0.75` (Low/Unreliable).\n"
-            f"4.  **Mandatory Justification:** For any confidence score below **0.95**, you are **REQUIRED** to provide a concise `reason`."
+            f"1.  **Core Principle:** The confidence score is a calculated metric of certainty. A field's overall confidence is **limited by the lowest confidence of any of its individual characters.**\n"
+            f"2.  **Calculation Basis:** Your score must integrate: a) Visual quality (blur, smudge), b) Handwriting legibility (clear print vs. messy cursive), c) Character ambiguity ('O' vs '0', '1' vs '7'), and d) Adherence to format rules.\n"
+            f"3.  **Strict Benchmarks (Non-Negotiable):**\n"
+            f"    - **0.98 - 1.00 (Perfect/Production Ready):** Absolute certainty. Machine-printed or exceptionally clear handwriting. No plausible alternative for any character.\n"
+            f"    - **0.90 - 0.97 (High/Review Recommended):** Strong confidence, but with minor imperfections, like slight character ambiguity that context strongly overrules.\n"
+            f"    - **0.75 - 0.89 (Moderate/Human Review Required):** Reasonable confidence, but with documented uncertainty. Use this if one or two characters are genuinely ambiguous (e.g., a handwritten '4' that resembles a '9').\n"
+            f"    - **< 0.75 (Low/Unreliable):** Significant uncertainty. Multiple characters are ambiguous, text is smudged, or handwriting is barely legible.\n"
+            f"4.  **Mandatory Justification:** For any confidence score below **0.95**, you are **REQUIRED** to provide a concise `reason` field in the JSON, pinpointing the source of uncertainty."
         )
+        
         field_specific_prompts = {
             "date": (
-                f"You are a hyper-precise OCR engine. Your task is to extract the 8-digit date from a pre-cropped cheque date grid.\n\n"
+                f"You are a hyper-precise OCR engine specializing in messy, handwritten financial documents. Your task is to extract the 8-digit date from a pre-cropped image of a cheque's date grid.\n\n"
                 f"**CRITICAL INTERNAL PROCESS:**\n"
-                f"1.  **Analysis:** Your primary challenge is to **mentally erase the printed box lines** and focus *only* on the handwritten ink.\n"
-                f"2.  **Temporal Rule:** The current year is **{self.current_year}**. A valid cheque will be for **{self.current_year}** or late **{self.previous_year}**. Use this rule to disambiguate OCR errors.\n"
-                f"3.  **Final Formatting Step:** After identifying the date, your last step is to **re-format it into a strict 'DD-MM-YYYY' string.** For example, if you read '25/02/25' or '25022025', you MUST convert it to '25-02-2025' in your output.\n\n"
+                f"1.  **Digit-by-Digit Analysis:** Your primary challenge is to **mentally erase the printed box lines** and focus *only* on the handwritten ink that forms the digits. A vertical box line next to a '1' does NOT make it a '4' and similarly a line in front of a '3' does NOT make it an '8'.\n"
+                f"2.  **Apply Temporal Rule:** The current year is **{self.current_year}**. A valid cheque will be for **{self.current_year}** or late **{self.previous_year}**. A year like '{self.current_year + 1}' is invalid. Use this rule to disambiguate OCR errors. If the last digit of the year is ambiguous between a '{str(self.current_year)[-1]}' and '{str(self.current_year+1)[-1]}', you MUST conclude it is '{str(self.current_year)[-1]}'.\n\n"
+
                 f"{confidence_instructions}\n\n"
-                f"**FINAL OUTPUT:** A single, valid JSON object with 'value', 'confidence', and an optional 'reason'."
+                f"**FINAL OUTPUT:** A single, valid JSON object with 'value' (in 'DD-MM-YYYY' format or empty string), 'confidence' (float), and an optional 'reason' (string)."
             ),
             "amount": (
-                f"You are an expert financial OCR system. Your task is to extract the numeric 'courtesy amount' from a pre-cropped cheque amount box.\n\n"
+                f"You are an expert financial OCR system. Your task is to extract the numeric 'courtesy amount' from a pre-cropped image of a cheque's amount box.\n\n"
                 f"**CRITICAL INTERNAL PROCESS:**\n"
-                f"1.  **Handwriting Analysis:** Differentiate common confusions: '1' vs '7', '5' vs 'S', '0' vs '6'.\n"
-                f"2.  **Filtering Rule:** Discard ALL non-numeric characters ('₹', commas, '/-'). Only a single decimal point is allowed.\n"
+                f"1.  **Handwriting Analysis:** Pay extremely close attention to the handwritten numbers. Differentiate common confusions: '1' vs '7', '5' vs 'S', '0' vs '6', '2' vs 'Z'.\n"
+                f"2.  **Apply Strict Filtering Rule:** Discard ALL non-numeric characters ('₹', commas, '/-'). The ONLY allowed non-digit character is a single decimal point (.).\n"
                 f"3.  **Standardize Format:** Format the cleaned number to have exactly two decimal places (e.g., '887' becomes '887.00').\n\n"
                 f"{confidence_instructions}\n\n"
-                f"**FINAL OUTPUT:** A single, valid JSON object with 'value', 'confidence', and an optional 'reason'."
+                f"**FINAL OUTPUT:** A single, valid JSON object with 'value' (string, e.g., '5000.00' or empty), 'confidence' (float), and an optional 'reason' (string)."
             )
         }
+        
         base_prompt = (
             f"{field_specific_prompts.get(field_name, 'Extract the text visible in the image.')}\n\n"
             "Example JSON Output: {\"value\": \"1234.50\", \"confidence\": 0.88, \"reason\": \"Handwritten '4' is unclear and could be a '9'.\"}"
