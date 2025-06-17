@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="High-Confidence Cheque Extraction API",
     description="A production-grade API that uses dynamic cropping and strict, character-informed confidence scoring to extract cheque data.",
-    version="3.2.0"
+    version="3.3.0" # Version updated for bugfix
 )
 
 app.add_middleware(
@@ -113,9 +113,6 @@ class ChequeProcessor:
             return None
 
     def _get_field_prompt(self, field_name: str) -> str:
-        """Returns the specialized prompt with strict confidence scoring rules."""
-        
-        # --- Common Confidence Scoring Instructions for All Fields ---
         confidence_instructions = (
             f"**Confidence Scoring (Strict, Character-Informed, and Defensible):**\n"
             f"1.  **Core Principle:** The confidence score is a calculated metric of certainty. A field's overall confidence is **limited by the lowest confidence of any of its individual characters.**\n"
@@ -127,8 +124,6 @@ class ChequeProcessor:
             f"    - **< 0.75 (Low/Unreliable):** Significant uncertainty. Multiple characters are ambiguous, text is smudged, or handwriting is barely legible.\n"
             f"4.  **Mandatory Justification:** For any confidence score below **0.95**, you are **REQUIRED** to provide a concise `reason` field in the JSON, pinpointing the source of uncertainty."
         )
-
-        # --- Field-Specific Instructions ---
         field_specific_prompts = {
             "date": (
                 f"You are a hyper-precise OCR engine specializing in messy, handwritten financial documents. Your task is to extract the 8-digit date from a pre-cropped image of a cheque's date grid.\n\n"
@@ -148,8 +143,6 @@ class ChequeProcessor:
                 f"**FINAL OUTPUT:** A single, valid JSON object with 'value' (string, e.g., '5000.00' or empty), 'confidence' (float), and an optional 'reason' (string)."
             )
         }
-        
-        # --- Final Assembly of the Prompt ---
         base_prompt = (
             f"{field_specific_prompts.get(field_name, 'Extract the text visible in the image.')}\n\n"
             "Example JSON Output: {\"value\": \"1234.50\", \"confidence\": 0.88, \"reason\": \"Handwritten '4' is unclear and could be a '9'.\"}"
@@ -157,28 +150,21 @@ class ChequeProcessor:
         return base_prompt
 
     def _extract_field_from_crop(self, cropped_image_bytes: bytes, field_name: str) -> Dict[str, Any]:
-        """Sends a single cropped image to Vertex AI and parses the detailed response."""
         prompt = self._get_field_prompt(field_name)
         image_part = Part.from_data(data=cropped_image_bytes, mime_type='image/png')
-        
         try:
             response = self._call_vertex_ai_with_retry(prompt, image_part)
             extracted_data = self._extract_json_from_text(response.text)
-            
             if extracted_data and 'value' in extracted_data:
                 return {
-                    "field_name": field_name,
-                    "value": extracted_data.get("value", ""),
-                    "confidence": extracted_data.get("confidence", 0.0),
-                    "reason": extracted_data.get("reason") # Capture the reason field
+                    "field_name": field_name, "value": extracted_data.get("value", ""),
+                    "confidence": extracted_data.get("confidence", 0.0), "reason": extracted_data.get("reason")
                 }
         except Exception as e:
             logger.error(f"Extraction failed for field '{field_name}'. Error: {e}")
-        
         return {"field_name": field_name, "value": "", "confidence": 0.0, "reason": "Extraction failed"}
 
     def process_full_cheque_image(self, file_info: Dict) -> Dict:
-        """Orchestrates the full process for a single image: crop -> extract -> aggregate."""
         file_path = file_info['path']
         logger.info(f"Processing full cheque image: {file_path}")
         results = {"file_path": file_path, "extracted_fields": []}
@@ -186,13 +172,11 @@ class ChequeProcessor:
             image = Image.open(io.BytesIO(file_info['data']))
             image = image.convert("RGB")
             width, height = image.size
-            # 1. Crop for "date" (Top-Right Cell)
             date_coords = (int(2 * width / 3), 0, width, int(height / 3))
             date_crop = image.crop(date_coords)
             with io.BytesIO() as byte_arr:
                 date_crop.save(byte_arr, format='PNG')
                 results["extracted_fields"].append(self._extract_field_from_crop(byte_arr.getvalue(), "date"))
-            # 2. Crop for "amount" (Middle-Right Cell)
             amount_coords = (int(2 * width / 3), int(height / 3), width, int(2 * height / 3))
             amount_crop = image.crop(amount_coords)
             with io.BytesIO() as byte_arr:
@@ -209,7 +193,6 @@ class ChequeProcessor:
 # ==============================================================================
 
 def generate_excel_report(results: List[Dict], output_dir: str, job_id: str) -> str:
-    """Creates a consolidated Excel report, now including the 'reason' column."""
     excel_path = os.path.join(output_dir, f"cheque_extraction_report_{job_id}.xlsx")
     data_for_df = []
     for item in results:
@@ -221,13 +204,12 @@ def generate_excel_report(results: List[Dict], output_dir: str, job_id: str) -> 
             if name:
                 row[name] = field_result.get("value")
                 row[f"{name}_confidence"] = field_result.get("confidence")
-                row[f"{name}_reason"] = field_result.get("reason") # Add reason to the row
+                row[f"{name}_reason"] = field_result.get("reason")
         data_for_df.append(row)
     if not data_for_df:
         logger.warning(f"Job {job_id}: No data to generate a report.")
         return ""
     df = pd.DataFrame(data_for_df)
-    # Update column order to include reason
     ordered_cols = ["filepath"] + [col for name in FIELDS_TO_EXTRACT for col in (name, f"{name}_confidence", f"{name}_reason")] + ["error"]
     df = df.reindex(columns=[col for col in ordered_cols if col in df.columns])
     df.to_excel(excel_path, index=False, engine='xlsxwriter')
@@ -241,12 +223,24 @@ def background_processing_task(file_contents: List[bytes], file_names: List[str]
     try:
         images_to_process = []
         supported_ext = {'.jpg', '.jpeg', '.png', '.tiff', '.tif'}
+        
         for zip_content, zip_name in zip(file_contents, file_names):
             zip_extract_path = os.path.join(temp_dir, os.path.splitext(zip_name)[0])
             with zipfile.ZipFile(io.BytesIO(zip_content)) as zf:
                 zf.extractall(zip_extract_path)
+            
+            # --- ROBUST FILE DISCOVERY WITH FILTERS ---
             for root, _, files in os.walk(zip_extract_path):
+                # **FIX**: Skip the entire __MACOSX directory and its subdirectories
+                if '__MACOSX' in root.split(os.sep):
+                    continue
+
                 for file in files:
+                    # **FIX**: Skip individual metadata files that start with ._
+                    if file.startswith('._'):
+                        continue
+                    
+                    # Process only if it has a supported extension
                     if os.path.splitext(file)[1].lower() in supported_ext:
                         full_path = os.path.join(root, file)
                         with open(full_path, 'rb') as f_img:
@@ -254,22 +248,26 @@ def background_processing_task(file_contents: List[bytes], file_names: List[str]
                                 'path': os.path.relpath(full_path, temp_dir),
                                 'data': f_img.read()
                             })
+
         total_images = len(images_to_process)
         if total_images == 0:
-            raise ValueError("No supported image files found in the zip archives.")
-        logger.info(f"Job {job_id}: Found {total_images} images to process.")
+            raise ValueError("No valid image files found in the zip archives after filtering.")
+        
+        logger.info(f"Job {job_id}: Found {total_images} valid images to process.")
         processed_jobs[job_id]["total_files"] = total_images
+        
         all_results = []
         processor = ChequeProcessor()
         for i in range(0, total_images, API_CALL_BATCH_SIZE):
             batch = images_to_process[i:i + API_CALL_BATCH_SIZE]
-            logger.info(f"Job {job_id}: Processing batch {i//API_CALL_BATCH_SIZE + 1}...")
+            logger.info(f"Job {job_id}: Processing batch {i//API_CALL_BATCH_SIZE + 1}/{ (total_images + API_CALL_BATCH_SIZE - 1)//API_CALL_BATCH_SIZE }...")
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(batch)) as batch_executor:
                 future_to_image = {batch_executor.submit(processor.process_full_cheque_image, img): img for img in batch}
                 for future in concurrent.futures.as_completed(future_to_image):
                     all_results.append(future.result())
             processed_jobs[job_id]["processed_files"] = len(all_results)
             logger.info(f"Job {job_id}: Progress {len(all_results)}/{total_images} images.")
+            
         output_file_path = generate_excel_report(all_results, temp_dir, job_id)
         job_end_time = time.time()
         processed_jobs[job_id].update({
@@ -278,9 +276,11 @@ def background_processing_task(file_contents: List[bytes], file_names: List[str]
             "results_url": f"/download/{job_id}"
         })
         logger.info(f"Job {job_id} completed successfully.")
+        
     except Exception as e:
         logger.error(f"Job {job_id} failed: {e}", exc_info=True)
         processed_jobs[job_id].update({"status": "failed", "end_time": time.time(), "error_message": str(e)})
+
 
 # ==============================================================================
 # 5. FASTAPI ENDPOINTS
@@ -313,8 +313,7 @@ async def get_job_status(job_id: str):
     return job
 
 @app.get("/download/{job_id}")
-async def download_excel_report(job_id: str):
-    """Download the final Excel report for a completed job."""
+async def download_report(job_id: str):
     job = processed_jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
@@ -331,11 +330,4 @@ def root():
 
 
 if __name__ == "__main__":
-    # To run this app:
-    # 1. Make sure you have the required libraries:
-    #    pip install "fastapi[all]" uvicorn pandas openpyxl xlsxwriter google-cloud-aiplatform
-    # 2. Set up Google Cloud authentication in your environment:
-    #    gcloud auth application-default login
-    # 3. Run the server:
-    #    uvicorn main:app --host 0.0.0.0 --port 8000 --reload
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
