@@ -1,0 +1,17 @@
+# requirements.txt
+
+# Core web framework
+fastapi
+
+# ASGI server to run the application
+uvicorn[standard]
+
+# Google Cloud SDK for Vertex AI
+google-cloud-aiplatform
+
+# For data manipulation and creating the Excel file
+pandas
+
+# For writing to .xlsx format, used by pandas
+openpyxl
+xlsxwriter
