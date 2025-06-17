@@ -15,3 +15,6 @@ pandas
 # For writing to .xlsx format, used by pandas
 openpyxl
 xlsxwriter
+
+# For image cropping and manipulation
+Pillow
