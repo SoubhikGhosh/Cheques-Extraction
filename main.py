@@ -23,6 +23,7 @@ import traceback
 from google.api_core import exceptions as google_exceptions
 from datetime import datetime
 from PIL import Image, ImageFile
+from dateutil import parser # Import for robust date parsing
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -38,9 +39,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="High-Confidence Cheque Extraction API",
-    description="A production-grade API that uses dynamic cropping and strict, character-informed confidence scoring to extract cheque data.",
-    version="3.3.0" # Version updated for bugfix
+    title="Standardized Cheque Extraction API",
+    description="Uses dynamic cropping, strict confidence scoring, and robust post-processing to extract and standardize cheque data.",
+    version="3.5.0" # Version updated for enhanced date standardization
 )
 
 app.add_middleware(
@@ -80,9 +81,9 @@ processed_jobs = {}
 # ==============================================================================
 
 class ChequeProcessor:
-    """Handles image cropping and field extraction with strict confidence scoring."""
+    """Handles image cropping, field extraction, and data standardization."""
 
-    def __init__(self, model_name: str = "gemini-1.5-flash-001"):
+    def __init__(self, model_name: str = "gemini-1.5-flash-002"):
         self.model = GenerativeModel(model_name, safety_settings=SAFETY_SETTINGS)
         self.current_year = datetime.now().year
         self.previous_year = self.current_year - 1
@@ -115,32 +116,29 @@ class ChequeProcessor:
     def _get_field_prompt(self, field_name: str) -> str:
         confidence_instructions = (
             f"**Confidence Scoring (Strict, Character-Informed, and Defensible):**\n"
-            f"1.  **Core Principle:** The confidence score is a calculated metric of certainty. A field's overall confidence is **limited by the lowest confidence of any of its individual characters.**\n"
-            f"2.  **Calculation Basis:** Your score must integrate: a) Visual quality (blur, smudge), b) Handwriting legibility (clear print vs. messy cursive), c) Character ambiguity ('O' vs '0', '1' vs '7'), and d) Adherence to format rules.\n"
-            f"3.  **Strict Benchmarks (Non-Negotiable):**\n"
-            f"    - **0.98 - 1.00 (Perfect/Production Ready):** Absolute certainty. Machine-printed or exceptionally clear handwriting. No plausible alternative for any character.\n"
-            f"    - **0.90 - 0.97 (High/Review Recommended):** Strong confidence, but with minor imperfections, like slight character ambiguity that context strongly overrules.\n"
-            f"    - **0.75 - 0.89 (Moderate/Human Review Required):** Reasonable confidence, but with documented uncertainty. Use this if one or two characters are genuinely ambiguous (e.g., a handwritten '4' that resembles a '9').\n"
-            f"    - **< 0.75 (Low/Unreliable):** Significant uncertainty. Multiple characters are ambiguous, text is smudged, or handwriting is barely legible.\n"
-            f"4.  **Mandatory Justification:** For any confidence score below **0.95**, you are **REQUIRED** to provide a concise `reason` field in the JSON, pinpointing the source of uncertainty."
+            f"1.  **Core Principle:** A field's overall confidence is **limited by the lowest confidence of any of its individual characters.**\n"
+            f"2.  **Calculation Basis:** Your score must integrate: a) Visual quality (blur, smudge), b) Handwriting legibility, c) Character ambiguity ('O' vs '0', '1' vs '7'), and d) Adherence to format rules.\n"
+            f"3.  **Strict Benchmarks:** `0.98-1.00` (Perfect/Production Ready), `0.90-0.97` (High/Review Recommended), `0.75-0.89` (Moderate/Human Review Required), `< 0.75` (Low/Unreliable).\n"
+            f"4.  **Mandatory Justification:** For any confidence score below **0.95**, you are **REQUIRED** to provide a concise `reason`."
         )
         field_specific_prompts = {
             "date": (
-                f"You are a hyper-precise OCR engine specializing in messy, handwritten financial documents. Your task is to extract the 8-digit date from a pre-cropped image of a cheque's date grid.\n\n"
+                f"You are a hyper-precise OCR engine. Your task is to extract the 8-digit date from a pre-cropped cheque date grid.\n\n"
                 f"**CRITICAL INTERNAL PROCESS:**\n"
-                f"1.  **Digit-by-Digit Analysis:** Your primary challenge is to **mentally erase the printed box lines** and focus *only* on the handwritten ink that forms the digits. A vertical box line next to a '1' does NOT make it a '4'.\n"
-                f"2.  **Apply Temporal Rule:** The current year is **{self.current_year}**. A valid cheque will be for **{self.current_year}** or late **{self.previous_year}**. A year like '{self.current_year + 1}' is invalid. Use this rule to disambiguate OCR errors. If the last digit of the year is ambiguous between a '{str(self.current_year)[-1]}' and '{str(self.current_year+1)[-1]}', you MUST conclude it is '{str(self.current_year)[-1]}'.\n\n"
+                f"1.  **Analysis:** Your primary challenge is to **mentally erase the printed box lines** and focus *only* on the handwritten ink.\n"
+                f"2.  **Temporal Rule:** The current year is **{self.current_year}**. A valid cheque will be for **{self.current_year}** or late **{self.previous_year}**. Use this rule to disambiguate OCR errors.\n"
+                f"3.  **Final Formatting Step:** After identifying the date, your last step is to **re-format it into a strict 'DD-MM-YYYY' string.** For example, if you read '25/02/25' or '25022025', you MUST convert it to '25-02-2025' in your output.\n\n"
                 f"{confidence_instructions}\n\n"
-                f"**FINAL OUTPUT:** A single, valid JSON object with 'value' (in 'DD-MM-YYYY' format or empty string), 'confidence' (float), and an optional 'reason' (string)."
+                f"**FINAL OUTPUT:** A single, valid JSON object with 'value', 'confidence', and an optional 'reason'."
             ),
             "amount": (
-                f"You are an expert financial OCR system. Your task is to extract the numeric 'courtesy amount' from a pre-cropped image of a cheque's amount box.\n\n"
+                f"You are an expert financial OCR system. Your task is to extract the numeric 'courtesy amount' from a pre-cropped cheque amount box.\n\n"
                 f"**CRITICAL INTERNAL PROCESS:**\n"
-                f"1.  **Handwriting Analysis:** Pay extremely close attention to the handwritten numbers. Differentiate common confusions: '1' vs '7', '5' vs 'S', '0' vs '6', '2' vs 'Z'.\n"
-                f"2.  **Apply Strict Filtering Rule:** Discard ALL non-numeric characters ('₹', commas, '/-'). The ONLY allowed non-digit character is a single decimal point (.).\n"
+                f"1.  **Handwriting Analysis:** Differentiate common confusions: '1' vs '7', '5' vs 'S', '0' vs '6'.\n"
+                f"2.  **Filtering Rule:** Discard ALL non-numeric characters ('₹', commas, '/-'). Only a single decimal point is allowed.\n"
                 f"3.  **Standardize Format:** Format the cleaned number to have exactly two decimal places (e.g., '887' becomes '887.00').\n\n"
                 f"{confidence_instructions}\n\n"
-                f"**FINAL OUTPUT:** A single, valid JSON object with 'value' (string, e.g., '5000.00' or empty), 'confidence' (float), and an optional 'reason' (string)."
+                f"**FINAL OUTPUT:** A single, valid JSON object with 'value', 'confidence', and an optional 'reason'."
             )
         }
         base_prompt = (
@@ -150,21 +148,45 @@ class ChequeProcessor:
         return base_prompt
 
     def _extract_field_from_crop(self, cropped_image_bytes: bytes, field_name: str) -> Dict[str, Any]:
+        """Sends a cropped image to Vertex AI and standardizes the result."""
         prompt = self._get_field_prompt(field_name)
         image_part = Part.from_data(data=cropped_image_bytes, mime_type='image/png')
+        
         try:
             response = self._call_vertex_ai_with_retry(prompt, image_part)
             extracted_data = self._extract_json_from_text(response.text)
+            
             if extracted_data and 'value' in extracted_data:
+                # --- Post-processing and Standardization Logic ---
+                if field_name == "date":
+                    raw_date_value = extracted_data.get("value")
+                    if raw_date_value and isinstance(raw_date_value, str) and len(raw_date_value) >= 6:
+                        
+                        # --- NEW: Pre-processing for separator-less DDMMYYYY format ---
+                        if len(raw_date_value) == 8 and raw_date_value.isdigit():
+                            # Help the parser by formatting DDMMYYYY to DD-MM-YYYY
+                            raw_date_value = f"{raw_date_value[:2]}-{raw_date_value[2:4]}-{raw_date_value[4:]}"
+                        
+                        try:
+                            # Use dateutil.parser for robust parsing. dayfirst=True is crucial.
+                            parsed_date = parser.parse(raw_date_value, dayfirst=True)
+                            standardized_date = parsed_date.strftime('%d-%m-%Y')
+                            extracted_data["value"] = standardized_date
+                            logger.info(f"Standardized date '{raw_date_value}' to '{standardized_date}'")
+                        except (parser.ParserError, TypeError, ValueError) as e:
+                            logger.warning(f"Could not parse date '{raw_date_value}'. Keeping original from AI. Error: {e}")
+
                 return {
                     "field_name": field_name, "value": extracted_data.get("value", ""),
                     "confidence": extracted_data.get("confidence", 0.0), "reason": extracted_data.get("reason")
                 }
         except Exception as e:
             logger.error(f"Extraction failed for field '{field_name}'. Error: {e}")
+        
         return {"field_name": field_name, "value": "", "confidence": 0.0, "reason": "Extraction failed"}
 
     def process_full_cheque_image(self, file_info: Dict) -> Dict:
+        """Orchestrates the full process for a single image: crop -> extract -> aggregate."""
         file_path = file_info['path']
         logger.info(f"Processing full cheque image: {file_path}")
         results = {"file_path": file_path, "extracted_fields": []}
@@ -223,24 +245,16 @@ def background_processing_task(file_contents: List[bytes], file_names: List[str]
     try:
         images_to_process = []
         supported_ext = {'.jpg', '.jpeg', '.png', '.tiff', '.tif'}
-        
         for zip_content, zip_name in zip(file_contents, file_names):
             zip_extract_path = os.path.join(temp_dir, os.path.splitext(zip_name)[0])
             with zipfile.ZipFile(io.BytesIO(zip_content)) as zf:
                 zf.extractall(zip_extract_path)
-            
-            # --- ROBUST FILE DISCOVERY WITH FILTERS ---
             for root, _, files in os.walk(zip_extract_path):
-                # **FIX**: Skip the entire __MACOSX directory and its subdirectories
                 if '__MACOSX' in root.split(os.sep):
                     continue
-
                 for file in files:
-                    # **FIX**: Skip individual metadata files that start with ._
                     if file.startswith('._'):
                         continue
-                    
-                    # Process only if it has a supported extension
                     if os.path.splitext(file)[1].lower() in supported_ext:
                         full_path = os.path.join(root, file)
                         with open(full_path, 'rb') as f_img:
@@ -248,14 +262,11 @@ def background_processing_task(file_contents: List[bytes], file_names: List[str]
                                 'path': os.path.relpath(full_path, temp_dir),
                                 'data': f_img.read()
                             })
-
         total_images = len(images_to_process)
         if total_images == 0:
             raise ValueError("No valid image files found in the zip archives after filtering.")
-        
         logger.info(f"Job {job_id}: Found {total_images} valid images to process.")
         processed_jobs[job_id]["total_files"] = total_images
-        
         all_results = []
         processor = ChequeProcessor()
         for i in range(0, total_images, API_CALL_BATCH_SIZE):
@@ -267,7 +278,6 @@ def background_processing_task(file_contents: List[bytes], file_names: List[str]
                     all_results.append(future.result())
             processed_jobs[job_id]["processed_files"] = len(all_results)
             logger.info(f"Job {job_id}: Progress {len(all_results)}/{total_images} images.")
-            
         output_file_path = generate_excel_report(all_results, temp_dir, job_id)
         job_end_time = time.time()
         processed_jobs[job_id].update({
@@ -276,11 +286,9 @@ def background_processing_task(file_contents: List[bytes], file_names: List[str]
             "results_url": f"/download/{job_id}"
         })
         logger.info(f"Job {job_id} completed successfully.")
-        
     except Exception as e:
         logger.error(f"Job {job_id} failed: {e}", exc_info=True)
         processed_jobs[job_id].update({"status": "failed", "end_time": time.time(), "error_message": str(e)})
-
 
 # ==============================================================================
 # 5. FASTAPI ENDPOINTS
@@ -326,7 +334,7 @@ async def download_report(job_id: str):
 
 @app.get("/", include_in_schema=False)
 def root():
-    return {"message": "High-Confidence Cheque Extraction API is running. See /docs for details."}
+    return {"message": "Standardized Cheque Extraction API is running. See /docs for details."}
 
 
 if __name__ == "__main__":
